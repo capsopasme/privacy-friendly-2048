@@ -33,6 +33,8 @@ import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.preference.PreferenceManager;
 import android.util.DisplayMetrics;
@@ -90,9 +92,11 @@ public class GameActivity extends BaseActivityWithoutNavBar {
     public int numberFieldSize = 0;
     // views belong to this activity instance; static fields would leak the activity on rotation
     Element[][] elements = null;
-    /** Board before the last move, for undo. */
-    int[][] lastNumbers = null;
-    /** Scratch buffer the board is copied into before a move; swapped with lastNumbers. */
+    /** Boards before the last moves, oldest first, for undo. Slots past undoCount are spare buffers. */
+    private int[][][] undoBoards = new int[GameState.UNDO_LIMIT][][];
+    private final int[] undoPointsStack = new int[GameState.UNDO_LIMIT];
+    private int undoCount = 0;
+    /** Scratch buffer the board is copied into before a move; becomes an undo step if tiles moved. */
     private int[][] scratchNumbers = null;
     private Element[] emptyFields = null;
     static GameState gameState = null;
@@ -186,10 +190,11 @@ public class GameActivity extends BaseActivityWithoutNavBar {
         sharedPref = PreferenceManager.getDefaultSharedPreferences(this);
         animationActivated = sharedPref.getBoolean("pref_animationActivated", true);
 
-        if (sharedPref.getBoolean("settings_display", true))
-            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // the settings switch is stored under this key (it used to be read as "settings_display",
+        // which never exists, so the screen was always kept on whatever the switch said)
+        keepScreenOn = sharedPref.getBoolean("switch_preference_1", true);
         if (animationActivated)
-            requestHighestRefreshRate();
+            highModeId = findHighestRefreshMode();
         setContentView(R.layout.activity_game);
 
         initResources();
@@ -198,18 +203,103 @@ public class GameActivity extends BaseActivityWithoutNavBar {
     }
 
     @Override
+    public void onResume() {
+        super.onResume();
+        onUserInteraction();
+    }
+
+    @Override
+    protected void onStop() {
+        idleHandler.removeCallbacks(dropRefreshRate);
+        idleHandler.removeCallbacks(releaseScreen);
+        dropRefreshRate.run();
+        releaseScreen.run();
+        super.onStop();
+    }
+
+    @Override
     protected void onDestroy() {
+        idleHandler.removeCallbacksAndMessages(null);
         settleAll();
         super.onDestroy();
     }
 
+    // ---- power: high refresh rate and keep-screen-on only while the game is actually played ----
+
+    /** How long the high refresh rate is held after the last touch / move (covers every animation). */
+    private static final long HIGH_REFRESH_HOLD_MS = 1500;
+    /** The screen is kept on only this long after the last touch; then the system timeout applies. */
+    private static final long KEEP_SCREEN_ON_IDLE_MS = 5 * 60 * 1000;
+
+    private final Handler idleHandler = new Handler(Looper.getMainLooper());
+    private boolean keepScreenOn = true;
+    private boolean screenHeld = false;
+    /** Display mode with the highest refresh rate at the current resolution, 0 if not worth asking. */
+    private int highModeId = 0;
+    private boolean refreshBoosted = false;
+
+    private final Runnable dropRefreshRate = new Runnable() {
+        @Override
+        public void run() {
+            setPreferredDisplayMode(0);
+        }
+    };
+
+    private final Runnable releaseScreen = new Runnable() {
+        @Override
+        public void run() {
+            if (!screenHeld) return;
+            screenHeld = false;
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+    };
+
+    /** Any touch or key press anywhere in the activity, called before it is dispatched. */
+    @Override
+    public void onUserInteraction() {
+        super.onUserInteraction();
+        if (keepScreenOn) {
+            if (!screenHeld) {
+                screenHeld = true;
+                getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            }
+            idleHandler.removeCallbacks(releaseScreen);
+            idleHandler.postDelayed(releaseScreen, KEEP_SCREEN_ON_IDLE_MS);
+        }
+        holdHighRefreshRate();
+    }
+
     /**
-     * Asks for the panel's fastest mode (e.g. 120 Hz) at the current resolution while the game
-     * is in front, so the springs are rendered with every frame the display can show.
-     * Some ROMs cap unlisted apps at 60 Hz unless the window asks for more.
+     * Switches to the panel's fastest mode (e.g. 120 Hz) when a touch begins, so the switch has
+     * happened before the swipe is recognised and the springs get every frame; some ROMs cap
+     * unlisted apps at 60 Hz unless the window asks. Once the board is still again the request is
+     * withdrawn and the system may drop to a lower rate. Pinning 120 Hz while the player is only
+     * looking at the board was the largest avoidable drain of the game screen.
      */
-    private void requestHighestRefreshRate() {
+    private void holdHighRefreshRate() {
+        if (highModeId == 0) return;
+        if (!refreshBoosted) setPreferredDisplayMode(highModeId);
+        idleHandler.removeCallbacks(dropRefreshRate);
+        idleHandler.postDelayed(dropRefreshRate, HIGH_REFRESH_HOLD_MS);
+    }
+
+    private void setPreferredDisplayMode(int modeId) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+        boolean boost = modeId != 0;
+        if (boost == refreshBoosted) return;
+        try {
+            WindowManager.LayoutParams params = getWindow().getAttributes();
+            params.preferredDisplayModeId = modeId;
+            getWindow().setAttributes(params);
+            refreshBoosted = boost;
+        } catch (RuntimeException e) {
+            Log.w("display", "could not change refresh rate", e);
+            highModeId = 0;
+        }
+    }
+
+    private int findHighestRefreshMode() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return 0;
         try {
             Display display = getWindowManager().getDefaultDisplay();
             Display.Mode current = display.getMode();
@@ -221,11 +311,10 @@ public class GameActivity extends BaseActivityWithoutNavBar {
                     best = mode;
                 }
             }
-            WindowManager.LayoutParams params = getWindow().getAttributes();
-            params.preferredDisplayModeId = best.getModeId();
-            getWindow().setAttributes(params);
+            return best.getRefreshRate() > 61f ? best.getModeId() : 0;
         } catch (RuntimeException e) {
-            Log.w("display", "could not request refresh rate", e);
+            Log.w("display", "could not read display modes", e);
+            return 0;
         }
     }
 
@@ -257,26 +346,48 @@ public class GameActivity extends BaseActivityWithoutNavBar {
         }
     }
 
+    /** Remembers the board before a move; the oldest step is dropped once UNDO_LIMIT are stored. */
+    private void pushUndo(int[][] board, int pts) {
+        if (undoCount == GameState.UNDO_LIMIT) {
+            int[][] oldest = undoBoards[0];
+            System.arraycopy(undoBoards, 1, undoBoards, 0, GameState.UNDO_LIMIT - 1);
+            System.arraycopy(undoPointsStack, 1, undoPointsStack, 0, GameState.UNDO_LIMIT - 1);
+            undoCount--;
+            undoBoards[undoCount] = oldest; // spare, handed back as scratch below
+        }
+        int[][] spare = undoBoards[undoCount];
+        undoBoards[undoCount] = board;
+        undoPointsStack[undoCount] = pts;
+        undoCount++;
+        scratchNumbers = spare != null && spare.length == n ? spare : new int[n][n];
+        last_points = pts;
+        undo = true;
+    }
+
     private void handleUndo() {
-        setUndoVisible(false);
-        if (undo && lastNumbers != null && elements != null) {
+        if (undoCount > 0 && elements != null) {
+            undoCount--;
+            int[][] board = undoBoards[undoCount]; // stays in its slot as a spare buffer
             gameStatistics.undo();
-            points = last_points;
+            points = undoPointsStack[undoCount];
             pointsCounter.set(points, false);
             for (int i = 0; i < elements.length; i++) {
                 for (int j = 0; j < elements[i].length; j++) {
                     Element e = elements[i][j];
                     TileAnimations.settle(e);
-                    e.setNumber(lastNumbers[i][j]);
+                    e.setNumber(board[i][j]);
                     e.setX(e.dPosX);
                     e.setY(e.dPosY);
                     e.drawItem();
                 }
             }
-            undo = false;
+            undo = undoCount > 0;
+            last_points = undo ? undoPointsStack[undoCount - 1] : points;
+            gameOver = false;
             updateGameState();
         }
-        undo = false;
+        undo = undoCount > 0;
+        setUndoVisible(undo);
     }
 
     public void initResources() {
@@ -399,20 +510,38 @@ public class GameActivity extends BaseActivityWithoutNavBar {
         int size = n * n;
         if (gs == null || gs.numbers == null || gs.numbers.length != size)
             gs = new GameState(n);
-        if (gs.last_numbers == null || gs.last_numbers.length != size || gs.last_numbers == gs.numbers)
-            gs.last_numbers = new int[size];
+        if (gs.history == null || gs.history.length != GameState.UNDO_LIMIT)
+            gs.history = new int[GameState.UNDO_LIMIT][];
+        if (gs.historyPoints == null || gs.historyPoints.length != GameState.UNDO_LIMIT)
+            gs.historyPoints = new int[GameState.UNDO_LIMIT];
         int c = 0;
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < n; j++) {
-                gs.numbers[c] = elements[i][j].number;
-                gs.last_numbers[c] = lastNumbers[i][j];
-                c++;
-            }
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+                gs.numbers[c++] = elements[i][j].number;
+        // copied in place: the arrays are reused from move to move
+        for (int k = 0; k < undoCount; k++) {
+            int[] flat = gs.history[k];
+            if (flat == null || flat.length != size)
+                gs.history[k] = flat = new int[size];
+            int[][] board = undoBoards[k];
+            c = 0;
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++)
+                    flat[c++] = board[i][j];
+            gs.historyPoints[k] = undoPointsStack[k];
+        }
+        gs.historyCount = undoCount;
+        // single step for older versions reading this save
+        if (undoCount > 0) {
+            gs.last_numbers = gs.history[undoCount - 1];
+            gs.last_points = undoPointsStack[undoCount - 1];
+        } else {
+            gs.last_numbers = null;
+            gs.last_points = points;
         }
         gs.n = n;
         gs.points = points;
-        gs.last_points = last_points;
-        gs.undo = undo;
+        gs.undo = undoCount > 0;
         gameState = gs;
         updateHighestNumber();
         check2048();
@@ -442,6 +571,7 @@ public class GameActivity extends BaseActivityWithoutNavBar {
 
         recordCounter.set(record, false);
         pointsCounter.set(points, false);
+        restoreUndoHistory();
         undoButton.animate().cancel();
         undoButton.setAlpha(1f);
         undoButton.setScaleX(1f);
@@ -462,7 +592,6 @@ public class GameActivity extends BaseActivityWithoutNavBar {
         number_field_background.removeAllViews();
         number_field.removeAllViews();
         elements = new Element[n][n];
-        lastNumbers = new int[n][n];
         scratchNumbers = new int[n][n];
         emptyFields = new Element[n * n];
         for (int i = 0; i < n; i++) {
@@ -484,11 +613,6 @@ public class GameActivity extends BaseActivityWithoutNavBar {
                 number_field.addView(e);
             }
         }
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < n; j++) {
-                lastNumbers[i][j] = undo ? gameState.getLastNumber(i, j) : elements[i][j].number;
-            }
-        }
         if (newGame) {
             moved = true;
             addNumber();
@@ -496,6 +620,29 @@ public class GameActivity extends BaseActivityWithoutNavBar {
             addNumber();
             newGame = false;
         }
+    }
+
+    /** Loads the undo steps of the current game (saved or kept across rotation) into the stack. */
+    private void restoreUndoHistory() {
+        undoBoards = new int[GameState.UNDO_LIMIT][][];
+        undoCount = 0;
+        GameState gs = gameState;
+        int steps = (gs == null || gs.n != n || newGame) ? 0 : gs.undoSteps();
+        // a longer saved history keeps its newest steps
+        int first = Math.max(0, steps - GameState.UNDO_LIMIT);
+        for (int k = first; k < steps; k++) {
+            int[] flat = gs.undoBoard(k);
+            int[][] board = new int[n][n];
+            int c = 0;
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++)
+                    board[i][j] = flat[c++];
+            undoBoards[undoCount] = board;
+            undoPointsStack[undoCount] = gs.undoPoints(k);
+            undoCount++;
+        }
+        undo = undoCount > 0;
+        last_points = undo ? undoPointsStack[undoCount - 1] : points;
     }
 
     private void settleAll() {
@@ -625,11 +772,9 @@ public class GameActivity extends BaseActivityWithoutNavBar {
             return;
 
         gameStatistics.addMoves(1);
-        last_points = temp_points;
-        scratchNumbers = lastNumbers;
-        lastNumbers = before;
+        pushUndo(before, temp_points);
         setUndoVisible(true);
-        undo = true;
+        holdHighRefreshRate(); // restart the hold from the move itself, for slow swipes
         switch (dir) {
             case LEFT:
                 gameStatistics.moveL();

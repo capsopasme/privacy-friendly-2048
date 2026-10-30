@@ -29,12 +29,59 @@ import java.io.Serializable;
  * @version 20180807
  */
 public class GameState implements Serializable {
+    /**
+     * Pinned to the value the JVM computed for the class before the undo history was added,
+     * so saved games from older versions still load (new fields simply read as null / 0).
+     */
+    private static final long serialVersionUID = 4417047672509562656L;
+
+    /** How many moves can be undone in a row. */
+    public static final int UNDO_LIMIT = 5;
+
     public int n = 4;
     public int[] numbers;
+    /** Board before the last move (kept for saves read by older versions). */
     public int[] last_numbers;
     public int points = 0;
     public int last_points = 0;
     public boolean undo = false;
+
+    /** Boards before the last moves, oldest first; only the first {@link #historyCount} are valid. */
+    public int[][] history;
+    /** Score before each move in {@link #history}. */
+    public int[] historyPoints;
+    public int historyCount = 0;
+
+    /**
+     * Number of undo steps stored in this state. Saves from versions with a single undo step
+     * have no history but may still carry that one step in last_numbers.
+     */
+    public int undoSteps() {
+        int size = n * n;
+        if (history != null && historyPoints != null) {
+            int c = Math.min(historyCount, Math.min(history.length, historyPoints.length));
+            for (int i = 0; i < c; i++)
+                if (history[i] == null || history[i].length != size)
+                    return 0;
+            return Math.max(0, c);
+        }
+        if (undo && last_numbers != null && last_numbers.length == size && last_numbers != numbers)
+            return 1;
+        return 0;
+    }
+
+    /** Board of undo step {@code k} (0 = oldest), flattened row by row. */
+    public int[] undoBoard(int k) {
+        if (history != null && historyPoints != null)
+            return history[k];
+        return last_numbers;
+    }
+
+    public int undoPoints(int k) {
+        if (history != null && historyPoints != null)
+            return historyPoints[k];
+        return last_points;
+    }
 
     public GameState(int size) {
         numbers = new int[size * size];
