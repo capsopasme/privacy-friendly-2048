@@ -1133,7 +1133,17 @@ public class GameActivity extends BaseActivityWithoutNavBar {
     public void gameOver() {
         Log.i("record", "" + record + ", " + gameStatistics.getRecord());
         saveStatisticsToFile(gameStatistics);
-        new AlertDialog.Builder(this)
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        if (undoCount > 0) {
+            // the undo history (up to UNDO_LIMIT steps) survives the loss: step back and play on
+            builder.setNeutralButton(this.getResources().getString(R.string.undo), new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface dialog, int which) {
+                    handleUndo();
+                }
+            });
+        }
+        builder
                 .setTitle((this.getResources().getString(R.string.Titel_L_Message, points)))
                 .setMessage(this.getResources().getString(R.string.Lost_Message, points))
                 .setNegativeButton((this.getResources().getString(R.string.No_Message)), new DialogInterface.OnClickListener() {
